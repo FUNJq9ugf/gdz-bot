@@ -416,7 +416,7 @@ def main() -> None:
     scraper = FourBookScraper()
     resolver = TaskResolver(scraper=scraper, book_url=config.book_url)
 
-    app = Application.builder().token(config.token).post_init(on_startup).build()
+    app = Application.builder().token(config.token).job_queue(None).post_init(on_startup).build()
     app.bot_data["scraper"] = scraper
     app.bot_data["resolver"] = resolver
 
