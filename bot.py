@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import io
 import logging
 import os
@@ -22,6 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger(__name__)
+ACCESS_FILE = "access.json"
 
 URL_RE = re.compile(r"https?://\S+|4book\.org/\S+", re.IGNORECASE)
 DEFAULT_BOOK_URL = (
@@ -49,6 +51,8 @@ class BotConfig:
     webhook_url: str
     port: int
     webhook_path: str
+    admin_user_ids: set[int]
+    allowed_user_ids: set[int]
 
 
 class TaskResolver:
@@ -141,6 +145,8 @@ def load_config() -> BotConfig:
     webhook_url = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
     port = int(os.getenv("PORT", "8000"))
     webhook_path = os.getenv("WEBHOOK_PATH", token).strip().strip("/")
+    admin_user_ids = parse_user_id_set(os.getenv("ADMIN_USER_IDS", ""))
+    allowed_user_ids = parse_user_id_set(os.getenv("ALLOWED_USER_IDS", ""))
     return BotConfig(
         token=token,
         book_url=book_url,
@@ -148,7 +154,66 @@ def load_config() -> BotConfig:
         webhook_url=webhook_url,
         port=port,
         webhook_path=webhook_path,
+        admin_user_ids=admin_user_ids,
+        allowed_user_ids=allowed_user_ids,
     )
+
+
+def parse_user_id_set(raw_value: str) -> set[int]:
+    result: set[int] = set()
+    for part in re.split(r"[,\s]+", raw_value.strip()):
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            continue
+    return result
+
+
+def load_access_file() -> set[int]:
+    if not os.path.exists(ACCESS_FILE):
+        return set()
+    try:
+        with open(ACCESS_FILE, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except Exception:
+        LOGGER.exception("Failed to read access file")
+        return set()
+    values = payload.get("allowed_user_ids", [])
+    return {int(value) for value in values if str(value).isdigit()}
+
+
+def save_access_file(user_ids: set[int]) -> None:
+    with open(ACCESS_FILE, "w", encoding="utf-8") as file:
+        json.dump({"allowed_user_ids": sorted(user_ids)}, file, ensure_ascii=False, indent=2)
+
+
+def is_admin(context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    admin_ids: set[int] = context.application.bot_data["admin_user_ids"]
+    return user_id in admin_ids
+
+
+def has_access(context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    admin_ids: set[int] = context.application.bot_data["admin_user_ids"]
+    allowed_ids: set[int] = context.application.bot_data["allowed_user_ids"]
+    if not admin_ids:
+        return True
+    return user_id in admin_ids or user_id in allowed_ids
+
+
+async def ensure_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    user_id = user.id if user else None
+    if has_access(context, user_id):
+        return True
+    if update.message:
+        await update.message.reply_text("Доступ закрито. Надішліть адміну ваш ID через /id.")
+    return False
 
 
 def extract_url(text: str) -> str | None:
@@ -214,6 +279,50 @@ def get_active_resolver(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, TaskRe
     book_key = get_active_book_key(context)
     resolvers: dict[str, TaskResolver] = context.application.bot_data["resolvers"]
     return book_key, resolvers[book_key]
+
+
+def extract_page_number_safe(text: str) -> int | None:
+    cleaned = text.strip().lower().replace("\u2013", "-").replace("\u2014", "-")
+    match = re.search(r"(?:\u0441\u0442\u043e\u0440\.?|\u0441\u0442\u0440\.?|\u0441\.?)\s*(\d+)", cleaned)
+    if match:
+        return int(match.group(1))
+    if re.fullmatch(r"\d{1,4}", cleaned):
+        return int(cleaned)
+    return None
+
+
+def parse_page_range_safe(text: str) -> tuple[int, int] | None:
+    cleaned = text.strip().lower().replace("\u2013", "-").replace("\u2014", "-")
+    match = re.search(
+        r"(?:\u0441\u0442\u043e\u0440\.?|\u0441\u0442\u0440\.?|\u0441\.?)?\s*(\d{1,4})\s*-\s*(\d{1,4})",
+        cleaned,
+    )
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2))
+    return (start, end) if start <= end else (end, start)
+
+
+def entry_page_bounds_safe(label: str) -> tuple[int, int] | None:
+    cleaned = label.strip().lower().replace("\u2013", "-").replace("\u2014", "-")
+    match = re.search(
+        r"(?:\u0441\u0442\u043e\u0440\.?|\u0441\u0442\u0440\.?|\u0441\.?)\s*(\d{1,4})\s*-\s*(\d{1,4})",
+        cleaned,
+    )
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        return (start, end) if start <= end else (end, start)
+
+    single_match = re.search(
+        r"(?:\u0441\u0442\u043e\u0440\.?|\u0441\u0442\u0440\.?|\u0441\.?)\s*(\d{1,4})",
+        cleaned,
+    )
+    if single_match:
+        value = int(single_match.group(1))
+        return value, value
+    return None
 
 
 def build_subject_keyboard() -> ReplyKeyboardMarkup:
@@ -788,6 +897,8 @@ async def set_book_prompt_clean(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def start_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_access(update, context):
+        return
     context.user_data.setdefault("book_key", "algebra")
     if not update.message:
         return
@@ -802,14 +913,20 @@ async def start_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def select_algebra_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_access(update, context):
+        return
     await set_book_prompt_clean(update, context, "algebra")
 
 
 async def select_mova_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_access(update, context):
+        return
     await set_book_prompt_clean(update, context, "mova")
 
 
 async def reload_index_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_access(update, context):
+        return
     if not update.message:
         return
     book_key, resolver = get_active_resolver(context)
@@ -825,7 +942,7 @@ async def reload_index_clean(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[TaskEntry]:
     await resolver.ensure_index()
-    page_range = parse_page_range_clean(query)
+    page_range = parse_page_range_safe(query)
     if page_range:
         start, end = page_range
         matches: list[TaskEntry] = []
@@ -833,7 +950,7 @@ async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[Ta
         for entry in resolver._index.values():
             if entry.page_url in seen_urls:
                 continue
-            entry_bounds = entry_page_bounds_clean(entry.label)
+            entry_bounds = entry_page_bounds_safe(entry.label)
             if entry_bounds is None:
                 continue
             entry_start, entry_end = entry_bounds
@@ -841,10 +958,10 @@ async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[Ta
                 continue
             seen_urls.add(entry.page_url)
             matches.append(entry)
-        matches.sort(key=lambda item: ((entry_page_bounds_clean(item.label) or (0, 0))[0], item.label))
+        matches.sort(key=lambda item: ((entry_page_bounds_safe(item.label) or (0, 0))[0], item.label))
         return matches
 
-    page_number = extract_page_number_clean(query)
+    page_number = extract_page_number_safe(query)
     if page_number is None:
         return []
 
@@ -853,7 +970,7 @@ async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[Ta
     for entry in resolver._index.values():
         if entry.page_url in seen_urls:
             continue
-        entry_bounds = entry_page_bounds_clean(entry.label)
+        entry_bounds = entry_page_bounds_safe(entry.label)
         if entry_bounds is None:
             continue
         entry_start, entry_end = entry_bounds
@@ -866,8 +983,72 @@ async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[Ta
     return matches
 
 
+async def my_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    await update.message.reply_text(f"Ваш ID: {update.effective_user.id}")
+
+
+def parse_target_user_id(args: list[str]) -> int | None:
+    if not args:
+        return None
+    raw = args[0].strip()
+    if not re.fullmatch(r"-?\d+", raw):
+        return None
+    return int(raw)
+
+
+async def allow_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin(context, update.effective_user.id if update.effective_user else None):
+        await update.message.reply_text("Ця команда доступна лише адміну.")
+        return
+    target_user_id = parse_target_user_id(context.args)
+    if target_user_id is None:
+        await update.message.reply_text("Використання: /allow 123456789")
+        return
+    allowed_ids: set[int] = context.application.bot_data["allowed_user_ids"]
+    allowed_ids.add(target_user_id)
+    save_access_file(allowed_ids)
+    await update.message.reply_text(f"Доступ відкрито для ID {target_user_id}.")
+
+
+async def deny_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin(context, update.effective_user.id if update.effective_user else None):
+        await update.message.reply_text("Ця команда доступна лише адміну.")
+        return
+    target_user_id = parse_target_user_id(context.args)
+    if target_user_id is None:
+        await update.message.reply_text("Використання: /deny 123456789")
+        return
+    allowed_ids: set[int] = context.application.bot_data["allowed_user_ids"]
+    allowed_ids.discard(target_user_id)
+    save_access_file(allowed_ids)
+    await update.message.reply_text(f"Доступ закрито для ID {target_user_id}.")
+
+
+async def access_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin(context, update.effective_user.id if update.effective_user else None):
+        await update.message.reply_text("Ця команда доступна лише адміну.")
+        return
+    admin_ids: set[int] = context.application.bot_data["admin_user_ids"]
+    allowed_ids: set[int] = context.application.bot_data["allowed_user_ids"]
+    lines = [
+        f"Адміни: {', '.join(str(value) for value in sorted(admin_ids)) or 'не задані'}",
+        f"Доступ: {', '.join(str(value) for value in sorted(allowed_ids)) or 'порожньо'}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_message_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
+        return
+    if not await ensure_access(update, context):
         return
 
     text = (update.message.text or update.message.caption or "").strip()
@@ -923,11 +1104,11 @@ async def handle_message_clean(update: Update, context: ContextTypes.DEFAULT_TYP
 
         sources = [entry.page_url for entry in entries]
         if book_key == "mova":
-            page_range = parse_page_range_clean(text)
+            page_range = parse_page_range_safe(text)
             if page_range:
                 task_label = f"Стор. {page_range[0]}-{page_range[1]}"
             else:
-                page_number = extract_page_number_clean(text)
+                page_number = extract_page_number_safe(text)
                 task_label = f"Стор. {page_number}" if page_number is not None else text
         else:
             task_label = text if len(entries) > 1 else entries[0].label
@@ -983,11 +1164,17 @@ def main() -> None:
     app.bot_data["scraper"] = scraper
     app.bot_data["resolvers"] = resolvers
     app.bot_data["resolver"] = resolvers["algebra"]
+    app.bot_data["admin_user_ids"] = set(config.admin_user_ids)
+    app.bot_data["allowed_user_ids"] = set(config.allowed_user_ids) | load_access_file()
 
     app.add_handler(CommandHandler("start", start_clean))
     app.add_handler(CommandHandler("reload", reload_index_clean))
     app.add_handler(CommandHandler("algebra", select_algebra_clean))
     app.add_handler(CommandHandler("mova", select_mova_clean))
+    app.add_handler(CommandHandler("id", my_id_command))
+    app.add_handler(CommandHandler("allow", allow_user_command))
+    app.add_handler(CommandHandler("deny", deny_user_command))
+    app.add_handler(CommandHandler("access", access_list_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_clean))
     if config.webhook_url:
         webhook_url = f"{config.webhook_url}/{config.webhook_path}"
