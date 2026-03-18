@@ -170,6 +170,29 @@ def get_active_book_key(context: ContextTypes.DEFAULT_TYPE) -> str:
     return context.user_data.get("book_key", "algebra")
 
 
+def extract_page_number_clean(text: str) -> int | None:
+    cleaned = text.strip().lower()
+    match = re.search(r"(?:стор\.?|стр\.?|с\.?)\s*(\d+)", cleaned)
+    if match:
+        return int(match.group(1))
+    if re.fullmatch(r"\d{1,4}", cleaned):
+        return int(cleaned)
+    return None
+
+
+def parse_page_range_clean(text: str) -> tuple[int, int] | None:
+    cleaned = text.strip().lower()
+    cleaned = cleaned.replace("\u2013", "-").replace("\u2014", "-")
+    match = re.search(r"(?:стор\.?|стр\.?|с\.?)?\s*(\d{1,4})\s*-\s*(\d{1,4})", cleaned)
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2))
+    if start <= end:
+        return start, end
+    return end, start
+
+
 def get_active_resolver(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, TaskResolver]:
     book_key = get_active_book_key(context)
     resolvers: dict[str, TaskResolver] = context.application.bot_data["resolvers"]
@@ -783,6 +806,43 @@ async def reload_index_clean(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"Готово. Завантажено {count} сторінок.")
 
 
+async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[TaskEntry]:
+    await resolver.ensure_index()
+    page_range = parse_page_range_clean(query)
+    if page_range:
+        start, end = page_range
+        matches: list[TaskEntry] = []
+        seen_urls: set[str] = set()
+        for entry in resolver._index.values():
+            if entry.page_url in seen_urls:
+                continue
+            entry_page = extract_page_number_clean(entry.label)
+            if entry_page is None or entry_page < start or entry_page > end:
+                continue
+            seen_urls.add(entry.page_url)
+            matches.append(entry)
+        matches.sort(key=lambda item: (extract_page_number_clean(item.label) or 0, item.label))
+        return matches
+
+    page_number = extract_page_number_clean(query)
+    if page_number is None:
+        return []
+
+    matches: list[TaskEntry] = []
+    seen_urls: set[str] = set()
+    for entry in resolver._index.values():
+        if entry.page_url in seen_urls:
+            continue
+        entry_page = extract_page_number_clean(entry.label)
+        if entry_page != page_number:
+            continue
+        seen_urls.add(entry.page_url)
+        matches.append(entry)
+
+    matches.sort(key=lambda item: item.label)
+    return matches
+
+
 async def handle_message_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -814,7 +874,7 @@ async def handle_message_clean(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         try:
             if book_key == "mova":
-                entries = await resolver.find_many_by_page(text)
+                entries = await find_many_by_page_clean(resolver, text)
             else:
                 entries = await resolver.find_many(text)
         except Exception as exc:
@@ -840,8 +900,12 @@ async def handle_message_clean(update: Update, context: ContextTypes.DEFAULT_TYP
 
         sources = [entry.page_url for entry in entries]
         if book_key == "mova":
-            page_number = extract_page_number(text)
-            task_label = f"Стор. {page_number}" if page_number is not None else text
+            page_range = parse_page_range_clean(text)
+            if page_range:
+                task_label = f"Стор. {page_range[0]}-{page_range[1]}"
+            else:
+                page_number = extract_page_number_clean(text)
+                task_label = f"Стор. {page_number}" if page_number is not None else text
         else:
             task_label = text if len(entries) > 1 else entries[0].label
 
