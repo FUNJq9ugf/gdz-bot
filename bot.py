@@ -28,7 +28,7 @@ DEFAULT_BOOK_URL = (
     "https://4book.org/gdz-reshebniki-ukraina/10-klas/"
     "reshebnik-algebra-10-klas-merzlyak-2018-gdz"
 )
-UKR_MOVA_BOOK_URL = "https://4book.org/gdz-reshebniki-ukraina/10-klas/ukrayinska-mova"
+UKR_MOVA_BOOK_URL = "https://4book.org/gdz-reshebniki-ukraina/10-klas/gdz-ukrayinska-mova-10-klas-avramenko-2018"
 BOOK_ALIASES = {
     "algebra": "Алгебра 10 клас",
     "mova": "Українська мова 10 клас",
