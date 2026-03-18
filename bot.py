@@ -193,6 +193,23 @@ def parse_page_range_clean(text: str) -> tuple[int, int] | None:
     return end, start
 
 
+def entry_page_bounds_clean(label: str) -> tuple[int, int] | None:
+    cleaned = label.strip().lower()
+    cleaned = cleaned.replace("\u2013", "-").replace("\u2014", "-")
+    match = re.search(r"(?:стор\.?|стр\.?|с\.?)\s*(\d{1,4})\s*-\s*(\d{1,4})", cleaned)
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        return (start, end) if start <= end else (end, start)
+
+    single_match = re.search(r"(?:стор\.?|стр\.?|с\.?)\s*(\d{1,4})", cleaned)
+    if single_match:
+        value = int(single_match.group(1))
+        return value, value
+
+    return None
+
+
 def get_active_resolver(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, TaskResolver]:
     book_key = get_active_book_key(context)
     resolvers: dict[str, TaskResolver] = context.application.bot_data["resolvers"]
@@ -816,12 +833,15 @@ async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[Ta
         for entry in resolver._index.values():
             if entry.page_url in seen_urls:
                 continue
-            entry_page = extract_page_number_clean(entry.label)
-            if entry_page is None or entry_page < start or entry_page > end:
+            entry_bounds = entry_page_bounds_clean(entry.label)
+            if entry_bounds is None:
+                continue
+            entry_start, entry_end = entry_bounds
+            if entry_end < start or entry_start > end:
                 continue
             seen_urls.add(entry.page_url)
             matches.append(entry)
-        matches.sort(key=lambda item: (extract_page_number_clean(item.label) or 0, item.label))
+        matches.sort(key=lambda item: ((entry_page_bounds_clean(item.label) or (0, 0))[0], item.label))
         return matches
 
     page_number = extract_page_number_clean(query)
@@ -833,8 +853,11 @@ async def find_many_by_page_clean(resolver: TaskResolver, query: str) -> list[Ta
     for entry in resolver._index.values():
         if entry.page_url in seen_urls:
             continue
-        entry_page = extract_page_number_clean(entry.label)
-        if entry_page != page_number:
+        entry_bounds = entry_page_bounds_clean(entry.label)
+        if entry_bounds is None:
+            continue
+        entry_start, entry_end = entry_bounds
+        if not (entry_start <= page_number <= entry_end):
             continue
         seen_urls.add(entry.page_url)
         matches.append(entry)
