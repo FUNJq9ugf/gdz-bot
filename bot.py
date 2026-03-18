@@ -60,6 +60,9 @@ DEFAULT_BOOK_URL = (
 class BotConfig:
     token: str
     book_url: str
+    webhook_url: str
+    port: int
+    webhook_path: str
 
 
 class TaskResolver:
@@ -128,7 +131,16 @@ def load_config() -> BotConfig:
         raise RuntimeError("В файле .env не найден BOT_TOKEN.")
 
     book_url = os.getenv("BOOK_URL", DEFAULT_BOOK_URL).strip() or DEFAULT_BOOK_URL
-    return BotConfig(token=token, book_url=book_url)
+    webhook_url = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+    port = int(os.getenv("PORT", "8000"))
+    webhook_path = os.getenv("WEBHOOK_PATH", token).strip().strip("/")
+    return BotConfig(
+        token=token,
+        book_url=book_url,
+        webhook_url=webhook_url,
+        port=port,
+        webhook_path=webhook_path,
+    )
 
 
 def extract_url(text: str) -> str | None:
@@ -411,7 +423,19 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload", reload_index))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_v2))
-    app.run_polling()
+    if config.webhook_url:
+        webhook_url = f"{config.webhook_url}/{config.webhook_path}"
+        LOGGER.info("Starting webhook mode on port %s", config.port)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=config.port,
+            url_path=config.webhook_path,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+        )
+    else:
+        LOGGER.info("Starting polling mode")
+        app.run_polling()
 
 
 if __name__ == "__main__":
