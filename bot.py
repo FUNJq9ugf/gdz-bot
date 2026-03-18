@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from html import escape
 
 from dotenv import load_dotenv
-from telegram import InputFile, InputMediaPhoto, Update
+from telegram import InputFile, InputMediaPhoto, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -28,12 +28,24 @@ DEFAULT_BOOK_URL = (
     "https://4book.org/gdz-reshebniki-ukraina/10-klas/"
     "reshebnik-algebra-10-klas-merzlyak-2018-gdz"
 )
+UKR_MOVA_BOOK_URL = "https://4book.org/gdz-reshebniki-ukraina/10-klas/ukrayinska-mova"
+BOOK_ALIASES = {
+    "algebra": "Алгебра 10 клас",
+    "mova": "Українська мова 10 клас",
+}
+
+BOOK_ALIASES = {
+    "algebra": "Алгебра",
+    "mova": "Українська мова",
+}
+SUBJECT_BUTTON_TO_KEY = {value: key for key, value in BOOK_ALIASES.items()}
 
 
 @dataclass(slots=True)
 class BotConfig:
     token: str
     book_url: str
+    ukr_mova_book_url: str
     webhook_url: str
     port: int
     webhook_path: str
@@ -105,12 +117,14 @@ def load_config() -> BotConfig:
         raise RuntimeError("В файле .env не найден BOT_TOKEN.")
 
     book_url = os.getenv("BOOK_URL", DEFAULT_BOOK_URL).strip() or DEFAULT_BOOK_URL
+    ukr_mova_book_url = os.getenv("BOOK_URL_UKR_MOVA", UKR_MOVA_BOOK_URL).strip() or UKR_MOVA_BOOK_URL
     webhook_url = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
     port = int(os.getenv("PORT", "8000"))
     webhook_path = os.getenv("WEBHOOK_PATH", token).strip().strip("/")
     return BotConfig(
         token=token,
         book_url=book_url,
+        ukr_mova_book_url=ukr_mova_book_url,
         webhook_url=webhook_url,
         port=port,
         webhook_path=webhook_path,
@@ -120,6 +134,29 @@ def load_config() -> BotConfig:
 def extract_url(text: str) -> str | None:
     match = URL_RE.search(text)
     return match.group(0) if match else None
+
+
+def get_active_book_key(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("book_key", "algebra")
+
+
+def get_active_resolver(context: ContextTypes.DEFAULT_TYPE) -> tuple[str, TaskResolver]:
+    book_key = get_active_book_key(context)
+    resolvers: dict[str, TaskResolver] = context.application.bot_data["resolvers"]
+    return book_key, resolvers[book_key]
+
+
+def build_subject_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BOOK_ALIASES["algebra"], BOOK_ALIASES["mova"]]],
+        resize_keyboard=True,
+    )
+
+
+async def set_book(update: Update, context: ContextTypes.DEFAULT_TYPE, book_key: str) -> None:
+    context.user_data["book_key"] = book_key
+    if update.message:
+        await update.message.reply_text(f"Выбрана книга: {BOOK_ALIASES[book_key]}")
 
 
 def parse_task_number(value: str) -> tuple[int, ...] | None:
@@ -289,6 +326,50 @@ def build_media_groups(
     return groups
 
 
+def build_caption_ua(title: str, source_url: str, total: int, task_label: str | None = None) -> str:
+    safe_title = escape(title)
+    safe_url = escape(source_url)
+    lines = [f"<b>{safe_title}</b>"]
+    if task_label:
+        lines.append(f"Завдання: <code>{escape(task_label)}</code>")
+    lines.append(f"Знайдено зображень: {total}")
+    lines.append(f"<a href=\"{safe_url}\">Відкрити сторінку розв'язання</a>")
+    return "\n".join(lines)
+
+
+def build_media_groups_ua(
+    result: SolutionResult,
+    task_label: str | None,
+    files: list[bytes],
+) -> list[list[InputMediaPhoto]]:
+    groups: list[list[InputMediaPhoto]] = []
+    current_group: list[InputMediaPhoto] = []
+
+    for index, (image, content) in enumerate(zip(result.images, files, strict=True), start=1):
+        caption = None
+        parse_mode = None
+        if index == 1:
+            caption = build_caption_ua(result.title, result.source_url, len(result.images), task_label)
+            parse_mode = ParseMode.HTML
+
+        current_group.append(
+            InputMediaPhoto(
+                media=InputFile(content, filename=image.filename, attach=True),
+                caption=caption,
+                parse_mode=parse_mode,
+            )
+        )
+
+        if len(current_group) == 10:
+            groups.append(current_group)
+            current_group = []
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
+
+
 async def send_images_one_by_one(
     update: Update,
     result: SolutionResult,
@@ -307,6 +388,239 @@ async def send_images_one_by_one(
             caption=caption if index == 1 else None,
             parse_mode=ParseMode.HTML if index == 1 else None,
         )
+
+
+async def send_images_one_by_one_ua(
+    update: Update,
+    result: SolutionResult,
+    task_label: str | None,
+    files: list[bytes],
+) -> None:
+    if not update.message:
+        return
+
+    caption = build_caption_ua(result.title, result.source_url, len(result.images), task_label)
+    for index, (image, content) in enumerate(zip(result.images, files, strict=True), start=1):
+        stream = io.BytesIO(content)
+        stream.name = image.filename
+        await update.message.reply_photo(
+            photo=stream,
+            caption=caption if index == 1 else None,
+            parse_mode=ParseMode.HTML if index == 1 else None,
+        )
+
+
+async def start_multi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    current_book = BOOK_ALIASES[get_active_book_key(context)]
+    await update.message.reply_text(
+        f"Текущая книга: {current_book}\n"
+        "Команды переключения: /algebra и /mova\n"
+        "После выбора просто отправляй номер задания."
+    )
+
+
+async def select_algebra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_book(update, context, "algebra")
+
+
+async def select_mova(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_book(update, context, "mova")
+
+
+async def reload_index_multi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    book_key, resolver = get_active_resolver(context)
+    await update.message.reply_text(f"Обновляю индекс: {BOOK_ALIASES[book_key]}")
+    try:
+        count = await resolver.ensure_index(force=True)
+    except Exception as exc:
+        LOGGER.exception("Failed to rebuild task index")
+        await update.message.reply_text(f"Не удалось обновить индекс: {exc}")
+        return
+    await update.message.reply_text(f"Готово. Загружено {count} страниц.")
+
+
+async def handle_message_multi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    text = (update.message.text or update.message.caption or "").strip()
+    if not text:
+        await update.message.reply_text("Отправь номер задания или ссылку на 4book.org.")
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    scraper: FourBookScraper = context.application.bot_data["scraper"]
+    book_key, resolver = get_active_resolver(context)
+
+    url = extract_url(text)
+    task_label: str | None = None
+
+    if url:
+        sources = [url]
+    else:
+        try:
+            entries = await resolver.find_many(text)
+        except Exception as exc:
+            LOGGER.exception("Failed to load task index")
+            await update.message.reply_text(f"Не удалось загрузить индекс {BOOK_ALIASES[book_key]}: {exc}")
+            return
+
+        if not entries:
+            await update.message.reply_text(
+                f"Я не нашёл это задание в книге {BOOK_ALIASES[book_key]}.\n"
+                "Сменить книгу: /algebra или /mova"
+            )
+            return
+
+        sources = [entry.page_url for entry in entries]
+        task_label = text if len(entries) > 1 else entries[0].label
+
+    for source in sources:
+        caption_label = task_label if len(sources) == 1 else None
+        try:
+            result = await asyncio.to_thread(scraper.fetch_solution, source)
+        except ScraperError as exc:
+            await update.message.reply_text(str(exc))
+            continue
+        except Exception as exc:
+            LOGGER.exception("Failed to parse solution")
+            await update.message.reply_text(f"Не удалось обработать запрос: {exc}")
+            continue
+
+        try:
+            files = await asyncio.gather(
+                *[asyncio.to_thread(scraper.download_image, image) for image in result.images]
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to download images")
+            await update.message.reply_text(f"Решение найдено, но не удалось скачать изображения: {exc}")
+            continue
+
+        media_groups = build_media_groups_ua(result, caption_label, files)
+        try:
+            for group in media_groups:
+                await update.message.reply_media_group(media=group)
+        except BadRequest:
+            LOGGER.exception("Failed to send media group")
+            await send_images_one_by_one_ua(update, result, caption_label, files)
+
+
+async def set_book_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, book_key: str) -> None:
+    context.user_data["book_key"] = book_key
+    if update.message:
+        await update.message.reply_text(
+            f"Обрано предмет: {BOOK_ALIASES[book_key]}",
+            reply_markup=build_subject_keyboard(),
+        )
+
+
+async def start_ua(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    current_book = BOOK_ALIASES[get_active_book_key(context)]
+    await update.message.reply_text(
+        f"Вітаю. Поточний предмет: {current_book}\n"
+        "Оберіть предмет кнопкою нижче або командами /algebra і /mova.\n"
+        "Після цього просто надішліть номер вправи.",
+        reply_markup=build_subject_keyboard(),
+    )
+
+
+async def select_algebra_ua(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_book_prompt(update, context, "algebra")
+
+
+async def select_mova_ua(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_book_prompt(update, context, "mova")
+
+
+async def reload_index_ua(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    book_key, resolver = get_active_resolver(context)
+    await update.message.reply_text(f"Оновлюю індекс для предмета: {BOOK_ALIASES[book_key]}")
+    try:
+        count = await resolver.ensure_index(force=True)
+    except Exception as exc:
+        LOGGER.exception("Failed to rebuild task index")
+        await update.message.reply_text(f"Не вдалося оновити індекс: {exc}")
+        return
+    await update.message.reply_text(f"Готово. Завантажено {count} сторінок.")
+
+
+async def handle_message_ua(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    text = (update.message.text or update.message.caption or "").strip()
+    if not text:
+        await update.message.reply_text("Надішліть номер вправи або посилання на 4book.org.")
+        return
+
+    if text in SUBJECT_BUTTON_TO_KEY:
+        await set_book_prompt(update, context, SUBJECT_BUTTON_TO_KEY[text])
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    scraper: FourBookScraper = context.application.bot_data["scraper"]
+    book_key, resolver = get_active_resolver(context)
+
+    url = extract_url(text)
+    task_label: str | None = None
+
+    if url:
+        sources = [url]
+    else:
+        try:
+            entries = await resolver.find_many(text)
+        except Exception as exc:
+            LOGGER.exception("Failed to load task index")
+            await update.message.reply_text(f"Не вдалося завантажити індекс {BOOK_ALIASES[book_key]}: {exc}")
+            return
+
+        if not entries:
+            await update.message.reply_text(
+                f"Я не знайшов це завдання у предметі {BOOK_ALIASES[book_key]}.\n"
+                "Спробуйте інший номер або перемкніть предмет кнопками нижче.",
+                reply_markup=build_subject_keyboard(),
+            )
+            return
+
+        sources = [entry.page_url for entry in entries]
+        task_label = text if len(entries) > 1 else entries[0].label
+
+    for source in sources:
+        caption_label = task_label if len(sources) == 1 else None
+        try:
+            result = await asyncio.to_thread(scraper.fetch_solution, source)
+        except ScraperError as exc:
+            await update.message.reply_text(str(exc), reply_markup=build_subject_keyboard())
+            continue
+        except Exception as exc:
+            LOGGER.exception("Failed to parse solution")
+            await update.message.reply_text(f"Не вдалося опрацювати запит: {exc}")
+            continue
+
+        try:
+            files = await asyncio.gather(
+                *[asyncio.to_thread(scraper.download_image, image) for image in result.images]
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to download images")
+            await update.message.reply_text(f"Розв'язання знайдено, але не вдалося завантажити зображення: {exc}")
+            continue
+
+        media_groups = build_media_groups(result, caption_label, files)
+        try:
+            for group in media_groups:
+                await update.message.reply_media_group(media=group)
+        except BadRequest:
+            LOGGER.exception("Failed to send media group")
+            await send_images_one_by_one(update, result, caption_label, files)
 
 
 async def handle_message_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -377,7 +691,7 @@ async def handle_message_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def on_startup(app: Application) -> None:
-    resolver: TaskResolver = app.bot_data["resolver"]
+    resolver: TaskResolver = app.bot_data["resolvers"]["algebra"]
     try:
         count = await resolver.ensure_index()
         LOGGER.info("Exercise index loaded: %s pages", count)
@@ -388,15 +702,21 @@ async def on_startup(app: Application) -> None:
 def main() -> None:
     config = load_config()
     scraper = FourBookScraper()
-    resolver = TaskResolver(scraper=scraper, book_url=config.book_url)
+    resolvers = {
+        "algebra": TaskResolver(scraper=scraper, book_url=config.book_url),
+        "mova": TaskResolver(scraper=scraper, book_url=config.ukr_mova_book_url),
+    }
 
     app = Application.builder().token(config.token).job_queue(None).post_init(on_startup).build()
     app.bot_data["scraper"] = scraper
-    app.bot_data["resolver"] = resolver
+    app.bot_data["resolvers"] = resolvers
+    app.bot_data["resolver"] = resolvers["algebra"]
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reload", reload_index))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_v2))
+    app.add_handler(CommandHandler("start", start_ua))
+    app.add_handler(CommandHandler("reload", reload_index_ua))
+    app.add_handler(CommandHandler("algebra", select_algebra_ua))
+    app.add_handler(CommandHandler("mova", select_mova_ua))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_ua))
     if config.webhook_url:
         webhook_url = f"{config.webhook_url}/{config.webhook_path}"
         LOGGER.info("Starting webhook mode on port %s", config.port)
