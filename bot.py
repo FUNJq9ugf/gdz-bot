@@ -105,6 +105,26 @@ class TaskResolver:
         matches.sort(key=lambda item: item[0])
         return [entry for _, entry in matches]
 
+    async def find_many_by_page(self, query: str) -> list[TaskEntry]:
+        await self.ensure_index()
+        page_number = extract_page_number(query)
+        if page_number is None:
+            return []
+
+        matches: list[TaskEntry] = []
+        seen_urls: set[str] = set()
+        for entry in self._index.values():
+            if entry.page_url in seen_urls:
+                continue
+            entry_page = extract_page_number(entry.label)
+            if entry_page != page_number:
+                continue
+            seen_urls.add(entry.page_url)
+            matches.append(entry)
+
+        matches.sort(key=lambda item: item.label)
+        return matches
+
     @property
     def unique_count(self) -> int:
         return len({entry.page_url for entry in self._index.values()})
@@ -134,6 +154,16 @@ def load_config() -> BotConfig:
 def extract_url(text: str) -> str | None:
     match = URL_RE.search(text)
     return match.group(0) if match else None
+
+
+def extract_page_number(text: str) -> int | None:
+    cleaned = text.strip().lower()
+    match = re.search(r"(?:стор\.?|стр\.?|с\.?)\s*(\d+)", cleaned)
+    if match:
+        return int(match.group(1))
+    if re.fullmatch(r"\d{1,4}", cleaned):
+        return int(cleaned)
+    return None
 
 
 def get_active_book_key(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -690,6 +720,161 @@ async def handle_message_v2(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await send_images_one_by_one(update, result, caption_label, files)
 
 
+def subject_name(book_key: str) -> str:
+    return {
+        "algebra": "Алгебра",
+        "mova": "Українська мова",
+    }[book_key]
+
+
+def build_subject_keyboard_ua() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["Алгебра", "Українська мова"]], resize_keyboard=True)
+
+
+async def set_book_prompt_clean(update: Update, context: ContextTypes.DEFAULT_TYPE, book_key: str) -> None:
+    context.user_data["book_key"] = book_key
+    if not update.message:
+        return
+
+    prompt = (
+        "Надішліть номер вправи, наприклад 6.7."
+        if book_key == "algebra"
+        else "Надішліть номер сторінки, наприклад 33."
+    )
+    await update.message.reply_text(
+        f"Обрано предмет: {subject_name(book_key)}.\n{prompt}",
+        reply_markup=build_subject_keyboard_ua(),
+    )
+
+
+async def start_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.setdefault("book_key", "algebra")
+    if not update.message:
+        return
+    current_book = subject_name(get_active_book_key(context))
+    await update.message.reply_text(
+        "Вітаю.\n"
+        f"Поточний предмет: {current_book}.\n"
+        "Оберіть предмет кнопкою нижче.\n"
+        "Для алгебри надсилайте номер вправи, для української мови — номер сторінки.",
+        reply_markup=build_subject_keyboard_ua(),
+    )
+
+
+async def select_algebra_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_book_prompt_clean(update, context, "algebra")
+
+
+async def select_mova_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_book_prompt_clean(update, context, "mova")
+
+
+async def reload_index_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    book_key, resolver = get_active_resolver(context)
+    await update.message.reply_text(f"Оновлюю індекс для предмета: {subject_name(book_key)}")
+    try:
+        count = await resolver.ensure_index(force=True)
+    except Exception as exc:
+        LOGGER.exception("Failed to rebuild task index")
+        await update.message.reply_text(f"Не вдалося оновити індекс: {exc}")
+        return
+    await update.message.reply_text(f"Готово. Завантажено {count} сторінок.")
+
+
+async def handle_message_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    text = (update.message.text or update.message.caption or "").strip()
+    if not text:
+        await update.message.reply_text(
+            "Надішліть номер вправи або сторінки, або посилання на 4book.org.",
+            reply_markup=build_subject_keyboard_ua(),
+        )
+        return
+
+    if text == "Алгебра":
+        await set_book_prompt_clean(update, context, "algebra")
+        return
+    if text == "Українська мова":
+        await set_book_prompt_clean(update, context, "mova")
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    scraper: FourBookScraper = context.application.bot_data["scraper"]
+    book_key, resolver = get_active_resolver(context)
+
+    url = extract_url(text)
+    task_label: str | None = None
+
+    if url:
+        sources = [url]
+    else:
+        try:
+            if book_key == "mova":
+                entries = await resolver.find_many_by_page(text)
+            else:
+                entries = await resolver.find_many(text)
+        except Exception as exc:
+            LOGGER.exception("Failed to load task index")
+            await update.message.reply_text(
+                f"Не вдалося завантажити індекс {subject_name(book_key)}: {exc}",
+                reply_markup=build_subject_keyboard_ua(),
+            )
+            return
+
+        if not entries:
+            if book_key == "mova":
+                await update.message.reply_text(
+                    "Я не знайшов таку сторінку.\nСпробуйте номер сторінки, наприклад 33 або 50.",
+                    reply_markup=build_subject_keyboard_ua(),
+                )
+            else:
+                await update.message.reply_text(
+                    "Я не знайшов таку вправу.\nСпробуйте інший номер або перемкніть предмет кнопками нижче.",
+                    reply_markup=build_subject_keyboard_ua(),
+                )
+            return
+
+        sources = [entry.page_url for entry in entries]
+        if book_key == "mova":
+            page_number = extract_page_number(text)
+            task_label = f"Стор. {page_number}" if page_number is not None else text
+        else:
+            task_label = text if len(entries) > 1 else entries[0].label
+
+    for source in sources:
+        caption_label = task_label if len(sources) == 1 else None
+        try:
+            result = await asyncio.to_thread(scraper.fetch_solution, source)
+        except ScraperError as exc:
+            await update.message.reply_text(str(exc), reply_markup=build_subject_keyboard_ua())
+            continue
+        except Exception as exc:
+            LOGGER.exception("Failed to parse solution")
+            await update.message.reply_text(f"Не вдалося опрацювати запит: {exc}")
+            continue
+
+        try:
+            files = await asyncio.gather(
+                *[asyncio.to_thread(scraper.download_image, image) for image in result.images]
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to download images")
+            await update.message.reply_text(f"Розв'язання знайдено, але не вдалося завантажити зображення: {exc}")
+            continue
+
+        media_groups = build_media_groups_ua(result, caption_label, files)
+        try:
+            for group in media_groups:
+                await update.message.reply_media_group(media=group)
+        except BadRequest:
+            LOGGER.exception("Failed to send media group")
+            await send_images_one_by_one_ua(update, result, caption_label, files)
+
+
 async def on_startup(app: Application) -> None:
     resolver: TaskResolver = app.bot_data["resolvers"]["algebra"]
     try:
@@ -712,11 +897,11 @@ def main() -> None:
     app.bot_data["resolvers"] = resolvers
     app.bot_data["resolver"] = resolvers["algebra"]
 
-    app.add_handler(CommandHandler("start", start_ua))
-    app.add_handler(CommandHandler("reload", reload_index_ua))
-    app.add_handler(CommandHandler("algebra", select_algebra_ua))
-    app.add_handler(CommandHandler("mova", select_mova_ua))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_ua))
+    app.add_handler(CommandHandler("start", start_clean))
+    app.add_handler(CommandHandler("reload", reload_index_clean))
+    app.add_handler(CommandHandler("algebra", select_algebra_clean))
+    app.add_handler(CommandHandler("mova", select_mova_clean))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_clean))
     if config.webhook_url:
         webhook_url = f"{config.webhook_url}/{config.webhook_path}"
         LOGGER.info("Starting webhook mode on port %s", config.port)
