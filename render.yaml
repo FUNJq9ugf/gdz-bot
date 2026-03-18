@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: gdz-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOOK_URL
+        value: https://4book.org/gdz-reshebniki-ukraina/10-klas/reshebnik-algebra-10-klas-merzlyak-2018-gdz
