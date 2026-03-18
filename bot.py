@@ -7,16 +7,12 @@ import os
 import re
 from dataclasses import dataclass
 from html import escape
-from datetime import tzinfo
 
-import apscheduler.util as apscheduler_util
-import pytz
 from dotenv import load_dotenv
 from telegram import InputFile, InputMediaPhoto, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from apscheduler.schedulers import base as apscheduler_base
 
 from scraper import FourBookScraper, ScraperError, SolutionImage, SolutionResult, TaskEntry
 
@@ -26,28 +22,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 LOGGER = logging.getLogger(__name__)
-
-def _compat_astimezone(obj: str | tzinfo | None) -> tzinfo | None:
-    if isinstance(obj, str):
-        return pytz.timezone(obj)
-    if obj is None:
-        return None
-    if hasattr(obj, "localize") and hasattr(obj, "normalize"):
-        return obj
-
-    zone_name = getattr(obj, "key", None) or getattr(obj, "zone", None)
-    if zone_name:
-        return pytz.timezone(zone_name)
-    return pytz.UTC
-
-
-# PTB 21.x creates APScheduler's JobQueue during Application.builder().
-# On this Windows/Python setup APScheduler receives zoneinfo timezones and crashes,
-# so we coerce them into pytz-compatible objects before the builder is instantiated.
-apscheduler_util.astimezone = _compat_astimezone
-apscheduler_util.get_localzone = lambda: pytz.UTC
-apscheduler_base.astimezone = _compat_astimezone
-apscheduler_base.get_localzone = lambda: pytz.UTC
 
 URL_RE = re.compile(r"https?://\S+|4book\.org/\S+", re.IGNORECASE)
 DEFAULT_BOOK_URL = (
