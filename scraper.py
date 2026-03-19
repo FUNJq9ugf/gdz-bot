@@ -294,7 +294,14 @@ class FourBookScraper:
 
     def _looks_like_task_label(self, text: str) -> bool:
         cleaned = text.strip()
-        return bool(cleaned and re.search(r"\d+\.\d+", cleaned))
+        if not cleaned:
+            return False
+        if re.search(r"\d+\.\d+", cleaned):
+            return True
+        normalized = cleaned.lower().replace("\u2013", "-").replace("\u2014", "-")
+        if re.search(r"(?:стор\.?|стр\.?|с\.?)\s*\d{1,4}(?:\s*-\s*\d{1,4})?", normalized):
+            return True
+        return False
 
     def _task_keys(self, label: str) -> set[str]:
         normalized = self.normalize_task_label(label)
