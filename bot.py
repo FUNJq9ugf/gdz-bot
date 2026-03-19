@@ -6,6 +6,7 @@ import io
 import logging
 import os
 import re
+from types import MethodType
 from dataclasses import dataclass
 from html import escape
 
@@ -323,6 +324,24 @@ def entry_page_bounds_safe(label: str) -> tuple[int, int] | None:
         value = int(single_match.group(1))
         return value, value
     return None
+
+
+def patch_scraper_for_page_labels(scraper: FourBookScraper) -> None:
+    def _looks_like_task_label_patched(self: FourBookScraper, text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        if re.search(r"\d+\.\d+", cleaned):
+            return True
+        normalized = cleaned.lower().replace("\u2013", "-").replace("\u2014", "-")
+        return bool(
+            re.search(
+                r"(?:\u0441\u0442\u043e\u0440\.?|\u0441\u0442\u0440\.?|\u0441\.?)\s*\d{1,4}(?:\s*-\s*\d{1,4})?",
+                normalized,
+            )
+        )
+
+    scraper._looks_like_task_label = MethodType(_looks_like_task_label_patched, scraper)
 
 
 def build_subject_keyboard() -> ReplyKeyboardMarkup:
@@ -1155,6 +1174,7 @@ async def on_startup(app: Application) -> None:
 def main() -> None:
     config = load_config()
     scraper = FourBookScraper()
+    patch_scraper_for_page_labels(scraper)
     resolvers = {
         "algebra": TaskResolver(scraper=scraper, book_url=config.book_url),
         "mova": TaskResolver(scraper=scraper, book_url=config.ukr_mova_book_url),
